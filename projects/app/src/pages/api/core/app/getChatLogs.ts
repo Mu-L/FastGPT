@@ -1,44 +1,49 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
-import { jsonRes } from '@fastgpt/service/common/response';
-import { connectToDatabase } from '@/service/mongo';
 import { MongoChat } from '@fastgpt/service/core/chat/chatSchema';
-import type { PagingData } from '@/types';
 import { AppLogsListItemType } from '@/types/app';
 import { Types } from '@fastgpt/service/common/mongo';
 import { addDays } from 'date-fns';
 import type { GetAppChatLogsParams } from '@/global/core/api/appReq.d';
-import { authApp } from '@fastgpt/service/support/permission/auth/app';
+import { authApp } from '@fastgpt/service/support/permission/app/auth';
 import { ChatItemCollectionName } from '@fastgpt/service/core/chat/chatItemSchema';
+import { NextAPI } from '@/service/middleware/entry';
+import { WritePermissionVal } from '@fastgpt/global/support/permission/constant';
+import { readFromSecondary } from '@fastgpt/service/common/mongo/utils';
+import { parsePaginationRequest } from '@fastgpt/service/common/api/pagination';
+import { PaginationResponse } from '@fastgpt/web/common/fetch/type';
+import { addSourceMember } from '@fastgpt/service/support/user/utils';
 
-export default async function handler(req: NextApiRequest, res: NextApiResponse) {
-  try {
-    await connectToDatabase();
-    const {
-      pageNum = 1,
-      pageSize = 20,
-      appId,
-      dateStart = addDays(new Date(), -7),
-      dateEnd = new Date()
-    } = req.body as GetAppChatLogsParams;
+async function handler(
+  req: NextApiRequest,
+  _res: NextApiResponse
+): Promise<PaginationResponse<AppLogsListItemType>> {
+  const {
+    appId,
+    dateStart = addDays(new Date(), -7),
+    dateEnd = new Date()
+  } = req.body as GetAppChatLogsParams;
 
-    if (!appId) {
-      throw new Error('缺少参数');
+  const { pageSize = 20, offset } = parsePaginationRequest(req);
+
+  if (!appId) {
+    throw new Error('缺少参数');
+  }
+
+  // 凭证校验
+  const { teamId } = await authApp({ req, authToken: true, appId, per: WritePermissionVal });
+
+  const where = {
+    teamId: new Types.ObjectId(teamId),
+    appId: new Types.ObjectId(appId),
+    updateTime: {
+      $gte: new Date(dateStart),
+      $lte: new Date(dateEnd)
     }
+  };
 
-    // 凭证校验
-    const { teamId } = await authApp({ req, authToken: true, appId, per: 'w' });
-
-    const where = {
-      teamId: new Types.ObjectId(teamId),
-      appId: new Types.ObjectId(appId),
-      updateTime: {
-        $gte: new Date(dateStart),
-        $lte: new Date(dateEnd)
-      }
-    };
-
-    const [data, total] = await Promise.all([
-      MongoChat.aggregate([
+  const [list, total] = await Promise.all([
+    MongoChat.aggregate(
+      [
         { $match: where },
         {
           $sort: {
@@ -48,7 +53,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
             updateTime: -1
           }
         },
-        { $skip: (pageNum - 1) * pageSize },
+        { $skip: offset },
         { $limit: pageSize },
         {
           $lookup: {
@@ -128,25 +133,29 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
             userGoodFeedbackCount: 1,
             userBadFeedbackCount: 1,
             customFeedbacksCount: 1,
-            markCount: 1
+            markCount: 1,
+            outLinkUid: 1,
+            tmbId: 1
           }
         }
-      ]),
-      MongoChat.countDocuments(where)
-    ]);
-
-    jsonRes<PagingData<AppLogsListItemType>>(res, {
-      data: {
-        pageNum,
-        pageSize,
-        data,
-        total
+      ],
+      {
+        ...readFromSecondary
       }
-    });
-  } catch (error) {
-    jsonRes(res, {
-      code: 500,
-      error
-    });
-  }
+    ),
+    MongoChat.countDocuments(where, { ...readFromSecondary })
+  ]);
+
+  const listWithSourceMember = await addSourceMember({
+    list: list
+  });
+
+  const listWithoutTmbId = list.filter((item) => !item.tmbId);
+
+  return {
+    list: listWithSourceMember.concat(listWithoutTmbId),
+    total
+  };
 }
+
+export default NextAPI(handler);

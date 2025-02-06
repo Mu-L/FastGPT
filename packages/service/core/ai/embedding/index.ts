@@ -1,13 +1,17 @@
-import { VectorModelItemType } from '@fastgpt/global/core/ai/model.d';
+import { EmbeddingModelItemType } from '@fastgpt/global/core/ai/model.d';
 import { getAIApi } from '../config';
+import { countPromptTokens } from '../../../common/string/tiktoken/index';
+import { EmbeddingTypeEnm } from '@fastgpt/global/core/ai/constants';
+import { addLog } from '../../../common/system/log';
 
 type GetVectorProps = {
-  model: VectorModelItemType;
+  model: EmbeddingModelItemType;
   input: string;
+  type?: `${EmbeddingTypeEnm}`;
 };
 
 // text to vector
-export async function getVectorsByText({ model, input }: GetVectorProps) {
+export async function getVectorsByText({ model, input, type }: GetVectorProps) {
   if (!input) {
     return Promise.reject({
       code: 500,
@@ -20,14 +24,29 @@ export async function getVectorsByText({ model, input }: GetVectorProps) {
 
     // input text to vector
     const result = await ai.embeddings
-      .create({
-        ...model.defaultConfig,
-        model: model.model,
-        input: [input]
-      })
+      .create(
+        {
+          ...model.defaultConfig,
+          ...(type === EmbeddingTypeEnm.db && model.dbConfig),
+          ...(type === EmbeddingTypeEnm.query && model.queryConfig),
+          model: model.model,
+          input: [input]
+        },
+        model.requestUrl
+          ? {
+              path: model.requestUrl,
+              headers: model.requestAuth
+                ? {
+                    Authorization: `Bearer ${model.requestAuth}`
+                  }
+                : undefined
+            }
+          : {}
+      )
       .then(async (res) => {
         if (!res.data) {
-          return Promise.reject('Embedding API 404');
+          addLog.error('Embedding API is not responding', res);
+          return Promise.reject('Embedding API is not responding');
         }
         if (!res?.data?.[0]?.embedding) {
           console.log(res);
@@ -35,15 +54,20 @@ export async function getVectorsByText({ model, input }: GetVectorProps) {
           return Promise.reject(res.data?.err?.message || 'Embedding API Error');
         }
 
+        const [tokens, vectors] = await Promise.all([
+          countPromptTokens(input),
+          Promise.all(res.data.map((item) => unityDimensional(item.embedding)))
+        ]);
+
         return {
-          charsLength: input.length,
-          vectors: await Promise.all(res.data.map((item) => unityDimensional(item.embedding)))
+          tokens,
+          vectors
         };
       });
 
     return result;
   } catch (error) {
-    console.log(`Embedding Error`, error);
+    addLog.error(`Embedding Error`, error);
 
     return Promise.reject(error);
   }
